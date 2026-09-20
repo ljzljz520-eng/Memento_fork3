@@ -157,7 +157,7 @@ class SearchBar:
                     1000000,
                     (0, 0, 0),
                 )
-                if int(key) == int(self.frame_getter.current_displayed_frame_i):
+                if int(key) == int(self.frame_getter.current_displayed_capture_id):
                     pygame.draw.rect(
                         screen,
                         (255, 0, 0),

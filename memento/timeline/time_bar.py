@@ -1,18 +1,28 @@
-import memento.utils as utils
+import datetime
+
 import cv2
 import numpy as np
 import pygame
-import datetime
+
+import memento.utils as utils
+from memento.manifest import parse_time
 from memento.timeline.apps import Apps
+
+FRAME_PERIOD = 1.0 / utils.FPS
 
 
 class TimeBar:
+    """Time-based navigation over the sparse capture index.
+
+    The window is defined in *seconds*; captures are located by logical time
+    through the FrameGetter/manifest. Nothing here assumes dense integer
+    frame ids.
+    """
+
     def __init__(self, frame_getter):
         self.frame_getter = frame_getter
-        self.nb_frames = self.frame_getter.nb_frames
-        self.metadata_cache = self.frame_getter.metadata_cache
+        self.manifest = frame_getter.manifest
         self.show_bar = True
-        self.bar_border_trigger = 10
 
         # Actual graphical window size
         ws = self.frame_getter.window_size
@@ -21,30 +31,50 @@ class TimeBar:
         self.y = ws[1] - self.h - ws[1] // 10
         self.w = ws[0] - self.x * 2
 
-        self.min_tws = self.bar_border_trigger * 4
+        # Time window size in seconds
+        self.min_tws = 40.0
+        self.max_tws = utils.MAX_TWS / utils.FPS
+        self.tws = min(
+            max(self.min_tws, 10 * utils.SECONDS_PER_REC), self.max_tws
+        )
+        self.offset = 0.0  # seconds between latest capture and window end
 
-        # Time window size
-        self.tws = min(self.nb_frames, int(10 * utils.FPS * utils.SECONDS_PER_REC))
-        self.frame_offset = 0  # from the right
-        self.compute_time_window()  # To be called when frame_offset changes
+        self.compute_time_window()
 
-        self.current_frame_i = self.tw_end - 1
-        self.preview_frame_i = 0
+        last_pos = self.frame_getter.nb_frames - 1
+        self.current_pos = max(0, last_pos)
+        self.preview_capture_id = None
         self.preview_surf = None
         self.apps = Apps(self.frame_getter)
         self.today = datetime.datetime.now().strftime("%Y-%m-%d")
 
-    def zoom(self, dir):
-        self.tws = min(
-            min(self.nb_frames, utils.MAX_TWS),
-            max(self.min_tws, int(self.tws * (1 + dir * 0.1))),
-        )
+    # --------------------------------------------------------- window helpers
 
-        self.compute_time_window()
+    def zoom(self, direction):
+        center = self.tw_start + datetime.timedelta(seconds=self.tws / 2)
+        self.tws = min(
+            self.max_tws, max(self.min_tws, self.tws * (1 + direction * 0.1))
+        )
+        self.tw_start = center - datetime.timedelta(seconds=self.tws / 2)
+        self._recompute_end_and_clamp()
 
     def compute_time_window(self):
-        self.tw_end = int(self.nb_frames - self.frame_offset)
-        self.tw_start = max(0, int(self.tw_end - self.tws))
+        latest = self.frame_getter.latest_time()
+        if latest is not None:
+            self.tw_end = latest - datetime.timedelta(seconds=self.offset)
+        else:
+            self.tw_end = datetime.datetime.now()
+        self.tw_start = self.tw_end - datetime.timedelta(seconds=self.tws)
+
+    def _recompute_end_and_clamp(self):
+        latest = self.frame_getter.latest_time()
+        if latest is None:
+            self.compute_time_window()
+            return
+        self.tw_end = self.tw_start + datetime.timedelta(seconds=self.tws)
+        self.offset = max(0.0, (latest - self.tw_end).total_seconds())
+        self.tw_end = latest - datetime.timedelta(seconds=self.offset)
+        self.tw_start = self.tw_end - datetime.timedelta(seconds=self.tws)
 
     def get_friendly_date(self, date):
         day = date.split(" ")[0]
@@ -62,37 +92,64 @@ class TimeBar:
         else:
             return date
 
-    # TODO adjust time bar so that the cursor is visible when jumping that way
-    def set_current_frame_i(self, frame_i):
-        # nb_moves = frame_i - self.current_frame_i
-        # dir = 1 if nb_moves > 0 else -1
-        # print(self.current_frame_i, frame_i, nb_moves)
-        # for _ in range(nb_moves):
-        #     self.move_cursor(dir)
-        # # self.move_cursor(nb_moves)
-        self.current_frame_i = frame_i
+    @property
+    def current_capture_id(self):
+        cap = self.frame_getter.capture_at_position(self.current_pos)
+        return cap["capture_id"] if cap else None
+
+    def jump_to_capture(self, capture_id):
+        pos = self.frame_getter.position_of(capture_id)
+        if pos is None:
+            return
+        self.current_pos = pos
+        self._ensure_visible()
 
     def move_cursor(self, delta):
-        self.current_frame_i = max(
-            self.tw_start, min(self.tw_end - 1, self.current_frame_i + delta)
+        if self.frame_getter.nb_frames == 0:
+            return
+        self.current_pos = max(
+            0,
+            min(self.frame_getter.nb_frames - 1, self.current_pos + delta),
         )
+        self._ensure_visible()
 
-        if self.current_frame_i < self.tw_start + self.bar_border_trigger:
-            self.frame_offset = min(self.nb_frames - self.tws, self.frame_offset + 1)
-            self.compute_time_window()
+    def _ensure_visible(self):
+        cap = self.frame_getter.capture_at_position(self.current_pos)
+        if cap is None:
+            return
+        t = parse_time(cap["time"])
+        edge = 0.15
+        if t < self.tw_start + datetime.timedelta(seconds=self.tws * edge):
+            self.tw_start = t - datetime.timedelta(seconds=self.tws * edge)
+            self._recompute_end_and_clamp()
+        elif t > self.tw_end - datetime.timedelta(seconds=self.tws * edge):
+            self.tw_end = t + datetime.timedelta(seconds=self.tws * edge)
+            latest = self.frame_getter.latest_time()
+            self.tw_end = min(self.tw_end, latest)
+            self.offset = max(0.0, (latest - self.tw_end).total_seconds())
+            self.tw_end = latest - datetime.timedelta(seconds=self.offset)
+            self.tw_start = self.tw_end - datetime.timedelta(seconds=self.tws)
 
-        if self.current_frame_i > self.tw_end - self.bar_border_trigger:
-            self.frame_offset = max(0, self.frame_offset - 1)
-            self.compute_time_window()
+    def click_select(self, mouse_pos):
+        t = self.get_time(mouse_pos)
+        self.current_pos = self.frame_getter.position_at_or_before_time(t)
+        self._ensure_visible()
 
-    def get_frame_i(self, mouse_pos):
-        return int((mouse_pos[0] - self.x) / self.w * self.tws) + self.tw_start
+    def get_time(self, mouse_pos):
+        frac = (mouse_pos[0] - self.x) / self.w
+        frac = max(0.0, min(1.0, frac))
+        return self.tw_start + datetime.timedelta(seconds=frac * self.tws)
 
     def hover(self, mouse_pos):
         return utils.in_rect((self.x, self.y, self.w, self.h), mouse_pos)
 
     def draw_cursor(self, screen):
-        cursor_x = self.x + ((self.current_frame_i - self.tw_start) / self.tws) * self.w
+        cap = self.frame_getter.capture_at_position(self.current_pos)
+        if cap is None:
+            return
+        t = parse_time(cap["time"])
+        frac = (t - self.tw_start).total_seconds() / self.tws
+        cursor_x = self.x + frac * self.w
         pygame.draw.line(
             screen,
             (255, 255, 255),
@@ -104,60 +161,85 @@ class TimeBar:
         self.draw_time(screen, (cursor_x, self.y))
 
     def draw_bar(self, screen, mouse_pos):
-        segments = []
+        visible = self.frame_getter.captures_in_time_range(
+            self.tw_start, self.tw_end + datetime.timedelta(seconds=FRAME_PERIOD)
+        )
+        if not visible:
+            pygame.draw.rect(
+                screen, (40, 40, 40), (self.x, self.y, self.w, self.h),
+                border_radius=self.h // 4,
+            )
+            return
 
-        # Warning, it's backwards
-        last_app = self.metadata_cache.get_frame_metadata(self.tw_end)["window_title"]
-        segments.append({"app": last_app, "start": 0, "end": self.tw_end})
-        for i in range(self.tw_end, self.tw_start, -1):
-            app = self.metadata_cache.get_frame_metadata(i)["window_title"]
+        # Midpoint boundaries between consecutive visible captures.
+        times = [parse_time(f["time"]) for f in visible]
+        boundaries = []
+        for i, t in enumerate(times):
+            if i == 0:
+                left = self.tw_start
+            else:
+                left = times[i - 1] + (t - times[i - 1]) / 2
+            if i == len(times) - 1:
+                right = self.tw_end
+            else:
+                tn = times[i + 1]
+                right = t + (tn - t) / 2
+            boundaries.append((left, right))
 
-            segments[-1]["start"] = i  # current segment
-            if app != last_app:
-                segments.append({"app": app, "start": i, "end": i})
-            last_app = app
+        groups = []  # consecutive same-app runs
+        for frame, (left, right) in zip(visible, boundaries):
+            app = frame["window_title"]
+            if groups and groups[-1]["app"] == app:
+                groups[-1]["right"] = right
+            else:
+                groups.append({"app": app, "left": left, "right": right})
 
-        for segment in segments:
-            app = segment["app"]
-            start = segment["start"] - self.tw_start
-            end = segment["end"] - self.tw_start
-            middle = (start + end) / 2
-            seg_x = self.x + (start / self.tws) * self.w
-            seg_w = (end - start) / self.tws * self.w
-
+        for group in groups:
+            seg_x = self.x + (
+                (group["left"] - self.tw_start).total_seconds() / self.tws
+            ) * self.w
+            seg_w = (
+                (group["right"] - group["left"]).total_seconds() / self.tws
+            ) * self.w
             pygame.draw.rect(
                 screen,
-                self.apps.get_color(app),
-                (seg_x, self.y, seg_w, self.h),
+                self.apps.get_color(group["app"]),
+                (seg_x, self.y, max(1, seg_w), self.h),
                 border_radius=self.h // 4,
             )
 
-        for segment in segments:
-            app = segment["app"]
-            start = segment["start"] - self.tw_start
-            end = segment["end"] - self.tw_start
-            middle = (start + end) / 2
-            seg_x = self.x + (start / self.tws) * self.w
-            seg_w = (end - start) / self.tws * self.w
+        current_cid = self.current_capture_id
+        for frame, (left, right) in zip(visible, boundaries):
+            app = frame["window_title"]
+            middle = left + (right - left) / 2
+            seg_x = self.x + (
+                (left - self.tw_start).total_seconds() / self.tws
+            ) * self.w
+            seg_w = (
+                (right - left).total_seconds() / self.tws
+            ) * self.w
 
             if self.apps.get_icon(app) is not None:
-                if start <= self.current_frame_i <= end or utils.in_rect(
+                if frame["capture_id"] == current_cid or utils.in_rect(
                     (seg_x, self.y, seg_w, self.h), mouse_pos
                 ):
                     screen.blit(
                         self.apps.get_icon(app, small=False),
                         (
-                            self.x + (middle / self.tws) * self.w - self.apps.ig.size,
+                            self.x
+                            + ((middle - self.tw_start).total_seconds() / self.tws)
+                            * self.w
+                            - self.apps.ig.size,
                             self.y - self.apps.ig.size // 2,
                         ),
                     )
-
                 else:
                     screen.blit(
                         self.apps.get_icon(app, small=True),
                         (
                             self.x
-                            + (middle / self.tws) * self.w
+                            + ((middle - self.tw_start).total_seconds() / self.tws)
+                            * self.w
                             - self.apps.ig.size // 2,
                             self.y,
                         ),
@@ -167,10 +249,15 @@ class TimeBar:
     def draw_preview(self, screen, mouse_pos):
         if not self.hover(mouse_pos):
             return
-        frame_i = self.get_frame_i(mouse_pos)
-        if frame_i != self.preview_frame_i or self.preview_surf is None:
-            self.preview_frame_i = frame_i
-            frame = self.frame_getter.get_frame(frame_i)
+        t = self.get_time(mouse_pos)
+        pos = self.frame_getter.position_at_or_before_time(t)
+        cap = self.frame_getter.capture_at_position(pos)
+        if cap is None:
+            return
+        capture_id = cap["capture_id"]
+        if capture_id != self.preview_capture_id or self.preview_surf is None:
+            self.preview_capture_id = capture_id
+            frame = self.frame_getter.get_frame(capture_id)
             frame = cv2.resize(frame, (0, 0), fx=0.2, fy=0.2)
             self.preview_surf = pygame.surfarray.make_surface(frame)
         screen.blit(
@@ -184,8 +271,12 @@ class TimeBar:
     def draw_time(self, screen, pos):
         if not self.hover(pos):
             return
-        frame_i = self.get_frame_i(pos)
-        time = self.metadata_cache.get_frame_metadata(frame_i)["time"].strip('"')
+        t = self.get_time(pos)
+        capture_pos = self.frame_getter.position_at_or_before_time(t)
+        cap = self.frame_getter.capture_at_position(capture_pos)
+        if cap is None:
+            return
+        time = cap["time"]
         time = self.get_friendly_date(time)
         font = pygame.font.SysFont("Arial", 20)
         text = font.render(time, True, (0, 0, 0))

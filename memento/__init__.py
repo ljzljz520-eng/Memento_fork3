@@ -1,12 +1,12 @@
-from memento.background import Background
-from memento.timeline.timeline import Timeline
-
-
 def bg():
+    from memento.background import Background
+
     backgound = Background()
     backgound.run()
 
 
 def tl():
+    from memento.timeline.timeline import Timeline
+
     t = Timeline()
     t.run()

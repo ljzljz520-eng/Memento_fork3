@@ -1,37 +1,76 @@
-import os
-from glob import glob
-import memento.utils as utils
-from memento.caching import ReadersCache, MetadataCache
+import bisect
+
 import cv2
 import numpy as np
 
+from memento.caching import MetadataCache, ReadersCache
+from memento.manifest import parse_time
+
 
 class FrameGetter:
-    def __init__(self, window_size):
+    """Navigates captures by logical time and manifest.
+
+    ``self.captures`` is the session-ordered list of live capture entries
+    (sorted by time). Its position is a *session-only* logical index; the
+    permanent identity used everywhere is ``capture_id``.
+    """
+
+    def __init__(self, window_size, manifest=None):
         self.window_size = window_size
 
-        self.readers_cache = ReadersCache()
-        self.metadata_cache = MetadataCache()
+        from memento.caching import load_manifest
+
+        self.manifest = manifest or load_manifest()
+        self.readers_cache = ReadersCache(self.manifest)
+        self.metadata_cache = MetadataCache(self.manifest)
         self.annotations = {}
         self.current_ret_annotated = 0
-        self.nb_frames = int(
-            (
-                len(glob(os.path.join(utils.CACHE_PATH, "*.mp4")))
-                * utils.FPS
-                * utils.SECONDS_PER_REC
-            )
-        )
+        self._build_capture_index()
         self.nb_results = 0
         self.debug_mode = False
 
-        self.current_displayed_frame_i = 0
+        self.current_displayed_capture_id = None
         self.current_displayed_frame = None
+
+    def _build_capture_index(self):
+        self.captures = self.manifest.sorted_captures()
+        self.nb_frames = len(self.captures)
+        self._position_by_capture = {}
+        times = []
+        for pos, frame in enumerate(self.captures):
+            self._position_by_capture[frame["capture_id"]] = pos
+            times.append(parse_time(frame["time"]))
+        self._times = times
+
+    # ------------------------------------------------------------- accessors
+
+    def capture_at_position(self, pos):
+        if 0 <= pos < len(self.captures):
+            return self.captures[pos]
+        return None
+
+    def position_of(self, capture_id):
+        return self._position_by_capture.get(int(capture_id))
+
+    def position_at_or_before_time(self, dt):
+        pos = bisect.bisect_right(self._times, dt) - 1
+        return max(0, pos)
+
+    def captures_in_time_range(self, start_dt, end_dt):
+        lo = bisect.bisect_left(self._times, start_dt)
+        hi = bisect.bisect_left(self._times, end_dt)
+        return self.captures[lo:hi]
+
+    def latest_time(self):
+        return self._times[-1] if self._times else None
+
+    # ---------------------------------------------------------------- frames
 
     def toggle_debug_mode(self):
         self.debug_mode = not self.debug_mode
         self.clear_annotations()
 
-    def get_frame(self, frame_i, resize=None):
+    def get_frame(self, capture_id, resize=None):
         im = self.current_displayed_frame
 
         # Resize frame if needed, still use cache
@@ -40,25 +79,25 @@ class FrameGetter:
 
         # Avoid resizing and converting the same frame each time
         if (
-            frame_i != self.current_displayed_frame_i
+            capture_id != self.current_displayed_capture_id
             or self.current_displayed_frame is None
         ):
-            im = self.readers_cache.get_frame(min(self.nb_frames - 1, frame_i))
-            self.process_debug(frame_i)
-            im = self.annotate_frame(frame_i, im)
+            im = self.readers_cache.get_frame(capture_id)
+            self.process_debug(capture_id)
+            im = self.annotate_frame(capture_id, im)
             if resize:
                 im = cv2.resize(im, resize)
             else:
                 im = cv2.resize(im, self.window_size)
             im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB).swapaxes(0, 1)
             self.current_displayed_frame = im
-            self.current_displayed_frame_i = frame_i
+            self.current_displayed_capture_id = capture_id
         return im
 
-    def process_debug(self, frame_i):
+    def process_debug(self, capture_id):
         if self.debug_mode:
             self.clear_annotations()
-            frame_metadata = self.metadata_cache.get_frame_metadata(frame_i)
+            frame_metadata = self.metadata_cache.get_frame_metadata(capture_id)
             if "bbs" in frame_metadata:
                 res = []
                 for i in range(len(frame_metadata["bbs"])):
@@ -73,11 +112,11 @@ class FrameGetter:
                     }
                     entry["text"] = text
                     res.append(entry)
-                self.add_annotation(frame_i, res)
+                self.add_annotation(capture_id, res)
 
-    def annotate_frame(self, frame_i, frame):
-        if str(frame_i) in self.annotations.keys():
-            entries = self.annotations[str(frame_i)]
+    def annotate_frame(self, capture_id, frame):
+        if str(capture_id) in self.annotations.keys():
+            entries = self.annotations[str(capture_id)]
             for entry in entries:
                 bb = entry["bb"]
                 x = int(bb["x"])
@@ -127,14 +166,15 @@ class FrameGetter:
         return frame
 
     def get_next_annotated_frame_i(self):
+        """Return the next annotated capture id (cycling), or None."""
         if len(self.annotations.keys()) > 0:
-            frame_i = list(self.annotations.keys())[self.current_ret_annotated]
+            frame_id = list(self.annotations.keys())[self.current_ret_annotated]
             self.current_ret_annotated += 1
             if self.current_ret_annotated >= len(self.annotations.keys()):
                 self.current_ret_annotated = 0
-            return int(frame_i)
+            return int(frame_id)
         else:
-            return 0
+            return None
 
     def set_annotations(self, annotations):
         self.annotations = annotations
@@ -145,8 +185,8 @@ class FrameGetter:
 
     def get_annotated_frames(self):
         frames = []
-        for frame_i in list(self.annotations.keys())[:10]:
-            frames.append(self.get_frame(int(frame_i)))
+        for frame_id in list(self.annotations.keys())[:10]:
+            frames.append(self.get_frame(int(frame_id)))
 
         return frames
 
@@ -157,17 +197,17 @@ class FrameGetter:
                 text += entry["text"] + "\n"
         return text
 
-    def add_annotation(self, frame_i, annotations):
-        if str(frame_i) not in self.annotations.keys():
-            self.annotations[str(frame_i)] = []
+    def add_annotation(self, capture_id, annotations):
+        if str(capture_id) not in self.annotations.keys():
+            self.annotations[str(capture_id)] = []
 
         for annotation in annotations:
-            self.annotations[str(frame_i)].append(annotation)
+            self.annotations[str(capture_id)].append(annotation)
             self.nb_results += 1
         self.current_displayed_frame = None
 
-    def is_annotated(self, frame_i):
-        return str(frame_i) in self.annotations.keys()
+    def is_annotated(self, capture_id):
+        return str(capture_id) in self.annotations.keys()
 
     def clear_annotations(self):
         self.annotations = {}

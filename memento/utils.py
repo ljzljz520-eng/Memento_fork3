@@ -1,4 +1,3 @@
-import Xlib.display
 import av
 import fractions
 import time
@@ -21,6 +20,8 @@ CACHE_PATH = os.path.join(os.environ["HOME"], ".cache", "memento")
 
 
 def get_active_window():
+    import Xlib.display
+
     display = Xlib.display.Display()
     window = display.get_input_focus().focus
     if isinstance(window, Xlib.xobject.drawable.Window):
@@ -62,7 +63,9 @@ class Recorder:
 
     def __init__(self, filename):
         self.output = av.open(filename, "w")
-        self.stream = self.output.add_stream("h264", str(FPS))
+        self.stream = self.output.add_stream(
+            "h264", fractions.Fraction(str(FPS))
+        )
         self.stream.height = RESOLUTION[1]
         self.stream.width = RESOLUTION[0]
         self.stream.bit_rate = 8500e1

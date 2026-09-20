@@ -16,11 +16,19 @@ from langchain.embeddings.openai import OpenAIEmbeddings
 from memento.db import Db
 from langchain.vectorstores import Chroma
 from memento.segments import AppSegments
+from memento.manifest import Manifest
+from memento.purge import PurgeExecutor
 
 
 class Background:
     def __init__(self):
-        if os.path.exists(os.path.join(utils.CACHE_PATH, "0.json")):
+        os.makedirs(utils.CACHE_PATH, exist_ok=True)
+        existing = len(
+            [f for f in os.listdir(utils.CACHE_PATH) if f.endswith(".mp4")]
+        ) > 0 or os.path.exists(
+            os.path.join(utils.CACHE_PATH, "manifest.json")
+        )
+        if existing:
             print("EXISTING MEMENTO CACHE FOUND")
             print("Continue this recording or erase and start over ? ")
             print("1. Continue")
@@ -30,42 +38,37 @@ class Background:
                 print("Please choose 1 or 2")
                 choice = input("Choice: ")
 
-            if choice == "1":
-                self.nb_rec = len(
-                    [f for f in os.listdir(utils.CACHE_PATH) if f.endswith(".mp4")]
-                )
-                self.frame_i = int(self.nb_rec * utils.FPS * utils.SECONDS_PER_REC)
-            else:
+            if choice == "2":
                 os.system("rm -rf " + utils.CACHE_PATH)
-                self.nb_rec = 0
-                self.frame_i = 0
-        else:
-            self.nb_rec = 0
-            self.frame_i = 0
+                os.makedirs(utils.CACHE_PATH, exist_ok=True)
 
-        self.metadata_cache = MetadataCache()
+        # Loading the manifest migrates legacy dense files on first continue.
+        self.manifest = Manifest.load(utils.CACHE_PATH)
 
-        os.makedirs(utils.CACHE_PATH, exist_ok=True)
+        self.metadata_cache = MetadataCache(self.manifest)
         self.db = Db()
-        if "OPENAI_API_KEY" not in os.environ:
-            self.chromadb = None
-            print(
-                "No OPENAI_API_KEY environment variable found, LLM related features will not be available"
-            )
-        else:
-            self.chromadb = Chroma(
-                persist_directory=utils.CACHE_PATH,
-                embedding_function=OpenAIEmbeddings(),
-                collection_name="memento_db",
-            )
+
+        # Finish any purge interrupted by a crash before anything else.
+        self.chromadb = self._setup_chroma()
+        PurgeExecutor(self.db, self.manifest, self.chromadb).resume()
+
+        # A segment left unsealed by a previous crash cannot be appended to:
+        # seal it and start a fresh segment.
+        open_seg = self.manifest.open_segment()
+        if open_seg is not None:
+            self.manifest.seal(open_seg["uid"])
+            self.manifest.save()
+        self.segment = self.manifest.allocate_segment()
+        self.manifest.save()
 
         self.sct = mss.mss()
         self.rec = utils.Recorder(
-            os.path.join(utils.CACHE_PATH, str(self.nb_rec) + ".mp4")
+            self.manifest.abs_path(self.segment["media_path"])
         )
         self.rec.start()
 
         self.running = True
+        self.frames_in_segment = 0
 
         self.app_segments = AppSegments()
 
@@ -82,6 +85,18 @@ class Background:
             self.workers[i].start()
             print("started worker", i)
 
+    def _setup_chroma(self):
+        if "OPENAI_API_KEY" not in os.environ:
+            print(
+                "No OPENAI_API_KEY environment variable found, LLM related features will not be available"
+            )
+            return None
+        return Chroma(
+            persist_directory=utils.CACHE_PATH,
+            embedding_function=OpenAIEmbeddings(),
+            collection_name="memento_db",
+        )
+
     def process_images(self):
         # Infinite worker
 
@@ -92,7 +107,7 @@ class Background:
             start = time.time()
             data = self.images_queue.get()
 
-            frame_i = data["frame_i"]
+            capture_id = data["capture_id"]
             im = data["im"]
             prev_im = data["prev_im"]
             window_title = data["window_title"]
@@ -100,10 +115,10 @@ class Background:
             diffscore = utils.imgdiff(im, prev_im)
             if diffscore < 0.1:  # TODO tune this
                 results = []
-                print("Skipping frame", frame_i, "because of imgdiff score ", diffscore)
+                print("Skipping frame", capture_id, "because of imgdiff score ", diffscore)
             elif window_title == "memento-timeline":
                 results = []
-                print("Skipping frame", frame_i, "because looking at the timeline")
+                print("Skipping frame", capture_id, "because looking at the timeline")
             else:
                 start = time.time()
                 results = ocr.process_image(im)
@@ -111,7 +126,7 @@ class Background:
 
             self.results_queue.put(
                 {
-                    "frame_i": frame_i,
+                    "capture_id": capture_id,
                     "results": results,
                     "time": t,
                     "window_title": window_title,
@@ -143,21 +158,29 @@ class Background:
             im = cv2.resize(im, utils.RESOLUTION)
             asyncio.run(self.rec.new_im(im))
 
-            # Create metadata
+            # Stable identity + manifest registration come first, so the
+            # capture is always resolvable by the time metadata is written.
             t = json.dumps(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            capture_id = self.manifest.allocate_capture_id()
+            self.manifest.register_frame(
+                self.segment, capture_id, window_title, t
+            )
+            self.manifest.save()
+            self.frames_in_segment += 1
+
             self.images_queue.put(
                 {
                     "im": im,
                     "prev_im": prev_im,
                     "window_title": window_title,
                     "time": t,
-                    "frame_i": self.frame_i,
+                    "capture_id": capture_id,
                 }
             )
             prev_im = im
 
             self.metadata_cache.write(
-                self.frame_i,
+                capture_id,
                 {
                     "window_title": window_title,
                     "time": t,
@@ -182,25 +205,19 @@ class Background:
                         bbs.append(bb)
                         all_text += result["results"][i]["text"] + " "
 
+                    result_capture_id = result["capture_id"]
                     frame_metadata = self.metadata_cache.get_frame_metadata(
-                        result["frame_i"]
+                        result_capture_id
                     )
                     frame_metadata["bbs"] = bbs
                     frame_metadata["text"] = text
-                    self.metadata_cache.write(result["frame_i"], frame_metadata)
+                    self.metadata_cache.write(result_capture_id, frame_metadata)
                     if len(text) == 0:
                         continue
-                    # md = [
-                    #     {
-                    #         "id": str(result["frame_i"]),
-                    #         "time": result["time"],
-                    #         "window_title": result["window_title"],
-                    #     }
-                    # ]
 
                     self.app_segments.add(
                         result["window_title"],
-                        result["frame_i"],
+                        result_capture_id,
                         all_text,
                         result["time"],
                     )
@@ -209,7 +226,7 @@ class Background:
                         self.db.add_texts(
                             texts=text,
                             bbs=bbs,
-                            frame_i=result["frame_i"],
+                            frame_i=result_capture_id,
                             window_title=frame_metadata["window_title"],
                             time=frame_metadata["time"],
                         )
@@ -244,7 +261,6 @@ class Background:
                     except Exception as e:
                         print("================aaaaaaa", e)
                         print("text", text)
-                        # print("md", md)
                         print("===============")
 
                 except Exception:
@@ -252,11 +268,16 @@ class Background:
 
             print("QUEUE SIZE", self.images_queue.qsize())
 
-            self.frame_i += 1
-            if (self.frame_i % (utils.FPS * utils.SECONDS_PER_REC)) == 0:
+            if self.frames_in_segment >= utils.FPS * utils.SECONDS_PER_REC:
                 print("CLOSE")
                 self.rec.stop()
-                self.nb_rec += 1
+                self.manifest.seal(self.segment["uid"])
+                self.manifest.save()
+
+                self.segment = self.manifest.allocate_segment()
+                self.manifest.save()
+                self.frames_in_segment = 0
                 self.rec = utils.Recorder(
-                    os.path.join(utils.CACHE_PATH, str(self.nb_rec) + ".mp4")
+                    self.manifest.abs_path(self.segment["media_path"])
                 )
+                self.rec.start()

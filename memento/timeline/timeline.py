@@ -1,13 +1,16 @@
-import pygame
-from memento.timeline.frame_getter import FrameGetter
-from memento.timeline.time_bar import TimeBar
-from memento.timeline.search_bar import SearchBar
-from memento.timeline.region_selector import RegionSelector
-from memento.timeline.chat import Chat
-import memento.utils as utils
-import pyperclip
-from memento.timeline.ui import PopUpManager, Plot
 import time
+
+import pygame
+
+import memento.utils as utils
+from memento.db import Db
+from memento.timeline.chat import Chat
+from memento.timeline.frame_getter import FrameGetter
+from memento.timeline.purge_panel import PurgePanel
+from memento.timeline.region_selector import RegionSelector
+from memento.timeline.search_bar import SearchBar
+from memento.timeline.time_bar import TimeBar
+from memento.timeline.ui import Plot, PopUpManager
 
 
 class Timeline:
@@ -31,13 +34,15 @@ class Timeline:
         self.screen = pygame.display.set_mode(
             self.window_size, flags=pygame.SRCALPHA + pygame.NOFRAME
         )  # +pygame.FULLSCREEN)
-        # +pygame.HIDDEN
+        # +HIDDEN
         pygame.key.set_repeat(500, 50)
         self.clock = pygame.time.Clock()
 
         self.ctrl_pressed = False
 
+        self._db = None
         self.update()
+        self.purge_panel = PurgePanel(self)
 
         self.t = 0
         self.dt = 1
@@ -46,6 +51,11 @@ class Timeline:
 
         self.is_recording = False
         self.last_is_recording_update = 0
+
+    def db_conn(self):
+        if self._db is None:
+            self._db = Db()
+        return self._db
 
     def update(self):
         self.frame_getter = FrameGetter(self.window_size)
@@ -56,6 +66,17 @@ class Timeline:
         self.chat = Chat(self.frame_getter)
 
     def draw_current_frame(self):
+        if self.frame_getter.nb_frames == 0:
+            font = pygame.font.SysFont("Arial", 40)
+            t = font.render(
+                "No recordings yet. Start memento-bg to record.",
+                True, (200, 200, 200),
+            )
+            rect = t.get_rect(
+                center=(self.window_size[0] // 2, self.window_size[1] // 2)
+            )
+            self.screen.blit(t, rect)
+            return
         x = 0
         y = 0
         resize = None
@@ -67,17 +88,26 @@ class Timeline:
             x = self.search_bar.w
             y = (self.window_size[1] - h) // 2
         frame = self.frame_getter.get_frame(
-            self.time_bar.current_frame_i, resize=resize
+            self.time_bar.current_capture_id, resize=resize
         )
         surf = pygame.surfarray.make_surface(frame).convert()
         self.screen.blit(surf, (x, y))
 
     # TODO This is a mess
     def handle_inputs(self):
+        events = pygame.event.get()
+
+        # Purge modal consumes every event while open.
+        if self.purge_panel.open:
+            self.purge_panel.handle(events)
+            if self.purge_panel.needs_reload:
+                self.update()
+                self.purge_panel = PurgePanel(self)
+            return
+
         found = False
         ret_frame = None
         mouse_wheel = 0
-        events = pygame.event.get()
         found, search_bar_frame_i = self.search_bar.events(events)
         ret_frame = self.chat.events(events)
         for event in events:
@@ -93,13 +123,10 @@ class Timeline:
                     else:
                         self.time_bar.move_cursor((mouse_wheel))
                     self.region_selector.reset()
-                    # self.frame_getter.clear_annotations()
             if event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:
                     if self.time_bar.hover(event.pos):
-                        self.time_bar.set_current_frame_i(
-                            self.time_bar.get_frame_i(event.pos)
-                        )
+                        self.time_bar.click_select(event.pos)
                         self.region_selector.reset()
                     elif self.search_bar.active and self.search_bar.hover(event.pos):
                         pass
@@ -118,13 +145,15 @@ class Timeline:
                         continue
                     self.region_selector.end(event.pos)
                     frame = self.frame_getter.get_frame(
-                        self.time_bar.current_frame_i
+                        self.time_bar.current_capture_id
                     ).swapaxes(0, 1)
                     res = self.region_selector.region_ocr(frame)
                     if res is None:
                         continue
                     self.frame_getter.clear_annotations()
-                    self.frame_getter.add_annotation(self.time_bar.current_frame_i, res)
+                    self.frame_getter.add_annotation(
+                        self.time_bar.current_capture_id, res
+                    )
                     if not self.time_bar.hover(event.pos):
                         self.popup_manager.add_popup(
                             "Ctrl + C to copy text",
@@ -144,7 +173,7 @@ class Timeline:
                 if event.key == pygame.K_RETURN:
                     pass
                 if event.key == pygame.K_d:
-                    if self.search_bar.active or self.chat.active:
+                    if search_bar_active := self.search_bar.active or self.chat.active:
                         continue
                     self.frame_getter.toggle_debug_mode()
                     self.popup_manager.add_popup(
@@ -158,6 +187,8 @@ class Timeline:
                     self.ctrl_pressed = True
                     if event.key == pygame.K_c:
                         text = self.frame_getter.get_annotations_text()
+                        import pyperclip
+
                         pyperclip.copy(text)
                         self.popup_manager.add_popup(
                             "Text copied to clipboard",
@@ -168,6 +199,11 @@ class Timeline:
                     if event.key == pygame.K_t:
                         self.chat.activate()
                         self.search_bar.deactivate()
+
+                    if event.key == pygame.K_p:
+                        self.purge_panel.open_form()
+                        self.search_bar.deactivate()
+                        self.chat.deactivate()
             if event.type == pygame.KEYUP:
                 self.ctrl_pressed = False
 
@@ -175,24 +211,24 @@ class Timeline:
             if mouse_wheel != 0:
                 self.time_bar.zoom(mouse_wheel)
                 self.popup_manager.add_popup(
-                    "Zoom : " + str(self.time_bar.tws * 1 / utils.FPS) + "s",
+                    "Zoom : " + str(self.time_bar.tws) + "s",
                     (50, 70),
                     2,
                 )
 
         if search_bar_frame_i is not None:
-            self.time_bar.set_current_frame_i(search_bar_frame_i)
+            self.time_bar.jump_to_capture(search_bar_frame_i)
         elif found:
-            self.time_bar.set_current_frame_i(
-                self.frame_getter.get_next_annotated_frame_i()
-            )
+            capture_id = self.frame_getter.get_next_annotated_frame_i()
+            if capture_id is not None:
+                self.time_bar.jump_to_capture(capture_id)
 
         if ret_frame is not None:
-            self.time_bar.set_current_frame_i(int(ret_frame))
+            self.time_bar.jump_to_capture(int(ret_frame))
 
         if self.frame_getter.debug_mode:
             self.popup_manager.add_popup(
-                "Frame : " + str(self.time_bar.current_frame_i),
+                "Capture : " + str(self.time_bar.current_capture_id),
                 (50, self.window_size[1] - 70),
                 0.1,
             )
@@ -240,6 +276,7 @@ class Timeline:
                 self.region_selector.reset()
 
             self.region_selector.draw(self.screen, pygame.mouse.get_pos())
+            self.purge_panel.draw(self.screen)
 
             self.draw_and_update_is_recording()
             self.draw_and_compute_fps()

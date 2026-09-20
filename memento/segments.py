@@ -150,7 +150,9 @@ if __name__ == "__main__":
 
     for i in range(0, frame_getter.nb_frames):
         print(i)
-        frame_metadata = frame_getter.metadata_cache.get_frame_metadata(i)
+        capture = frame_getter.capture_at_position(i)
+        capture_id = capture["capture_id"]
+        frame_metadata = frame_getter.metadata_cache.get_frame_metadata(capture_id)
         app_name = frame_metadata["window_title"]
         all_text = ""
 
@@ -160,7 +162,7 @@ if __name__ == "__main__":
             text = frame_metadata["text"][j]
             all_text += text + " "
 
-        app_segments.add(app_name, i, all_text, "aze")
+        app_segments.add(app_name, capture_id, all_text, "aze")
 
     # for app_segment in app_segments.segments:
     #     app_segment.compute()

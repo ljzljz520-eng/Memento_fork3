@@ -30,16 +30,16 @@ class Apps:
         ws = self.frame_getter.window_size
         self.h = ws[1] // 40
 
-        self.metadata_cache = self.frame_getter.metadata_cache
         self.nb_frames = self.frame_getter.nb_frames
         self.ig = IconGetter(size=self.h)
 
-        # Hacky solution for faster timeline startup
+        # Hacky solution for faster timeline startup: sample sparse capture
+        # positions; capture entries already carry window_title.
         stride = 100
         if len(self.ig.icon_cache) == 0 or self.nb_frames < 1000:
             stride = 1
-        for i in range(0, self.nb_frames, stride):
-            app = self.metadata_cache.get_frame_metadata(i)["window_title"]
+        for pos in range(0, self.nb_frames, stride):
+            app = self.frame_getter.capture_at_position(pos)["window_title"]
             if app not in self.apps:
                 self.apps[app] = {}
                 if len(self.apps) < len(COLOR_PALETTE):
